@@ -57,6 +57,11 @@ final class RouterFunctionConfig {
 	}
 
 	static BiFunction<HttpServerRequest, HttpServerResponse, Publisher<Void>> text() {
+		try {
+			Thread.sleep(10);
+		} catch (InterruptedException e) {
+			throw new RuntimeException(e);
+		}
 		return (req, res) ->
 				res.header("Content-Type", "text/plain")
 						.sendObject(Unpooled.wrappedBuffer(msgBytes));
