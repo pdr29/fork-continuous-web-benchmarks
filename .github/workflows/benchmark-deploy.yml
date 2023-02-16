@@ -1,0 +1,216 @@
+name: benchmark-deploy
+
+on:
+#  schedule:
+#    - cron: '0 0 * * 0-5'
+  workflow_dispatch:
+    inputs:
+      app:
+        type: choice
+        description: Select the server application to test
+        default: 'reactornetty-benchmark-0.0.1-SNAPSHOT'
+        required: true
+        options:
+          - reactornetty-benchmark-0.0.1-SNAPSHOT
+          - webflux-benchmark-0.0.1-SNAPSHOT
+          - webfluxfn-benchmark-0.0.1-SNAPSHOT
+          - webmvc-benchmark-0.0.1-SNAPSHOT
+          - reactornetty-benchmark-0.0.1-SNAPSHOT;webflux-benchmark-0.0.1-SNAPSHOT;webfluxfn-benchmark-0.0.1-SNAPSHOT;webmvc-benchmark-0.0.1-SNAPSHOT
+      simulations:
+        description: 'List of simulation applications:'
+        required: false
+        type: string
+        default: 'TextPlain;Echo;JsonGet;JsonPost;HtmlGet'
+      increment:
+        description: 'Gatling increment:'
+        required: false
+        type: string
+        default: '128'
+      steps:
+        description: 'Gatling steps:'
+        required: false
+        type: string
+        default: '32'
+      trends:
+        description: 'Record benchmark result trends.'
+        required: false
+        type: boolean
+        default: false
+      alert-threshold:
+        description: 'Alert threshold like "150%". Percentage indicating how worse the current benchmark result is, e.g: 150% means that an alert happens when current benchmark result is 1.5x worse than previous:'
+        required: false
+        type: string
+        default: '125%'
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT }}
+  SERVER_INSTANCE: ${{ vars.SERVER_INSTANCE }}
+  CLIENT_INSTANCE: ${{ vars.CLIENT_INSTANCE }}
+  BUCKET: ${{ vars.BUCKET }}
+  ZONE: ${{ vars.ZONE }}
+  MACHINE_TYPE: ${{ vars.MACHINE_TYPE }}
+  SIMULATIONS : ${{ inputs.simulations || 'TextPlain;Echo;JsonGet;JsonPost;HtmlGet' }}
+  INCREMENT: ${{ inputs.increment || '128' }}
+  STEPS: ${{ inputs.steps || '32' }}
+  APP: ${{ inputs.app || 'reactornetty-benchmark-0.0.1-SNAPSHOT;webflux-benchmark-0.0.1-SNAPSHOT;webfluxfn-benchmark-0.0.1-SNAPSHOT;webmvc-benchmark-0.0.1-SNAPSHOT' }}
+  TRENDS: ${{ inputs.trends || false }}
+  ALERT_THRESHOLD: ${{ inputs.alert-threshold || '125%' }}
+
+permissions:
+  # Add "id-token" with the intended permissions
+  id-token: write
+  # contents permission to update benchmark contents in gh-pages branch
+  contents: write
+  # deployments permission to deploy GitHub pages website
+  #deployments: write
+
+jobs:
+  setup-build-publish-deploy:
+    name: Setup, Build, Publish, and Deploy
+    runs-on: ubuntu-latest
+
+    # Dynamically set some env variables
+    steps:
+    - name: Setenv
+      if: github.event.schedule=='*/6 * * * *'         # force trending and alert management
+      run: echo "::set-env name=TRENDS::true"
+
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Set up JDK
+      uses: actions/setup-java@v3
+      with:
+        java-version: '8'
+        distribution: 'temurin'
+
+    # Configure Workload Identity Federation and generate an access token.
+#    - id: 'auth'
+#      name: 'Authenticate to Google Cloud'
+#      uses: 'google-github-actions/auth@v1'
+#      with:
+#        workload_identity_provider: '${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}'
+#        service_account: '${{ secrets.GCP_SERVICE_ACCOUNT }}'
+
+    # Alternative option - authentication via credentials json
+    - id: 'auth'
+      uses: 'google-github-actions/auth@v1'
+      with:
+        credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+    # Setup gcloud CLI
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+
+    # Configure Docker to use the gcloud command-line tool as a credential helper for authentication
+    - run: |-
+        gcloud --quiet auth configure-docker
+
+    - name: Maven Compile
+      run: mvn --quiet -B package --file pom.xml
+
+    # Copy application to gcp client bucket
+    - name: Copy applications to client bucket
+      run: |-        
+        for application in $(echo $APP | tr ";" "\n"); do \
+          jarfile=$(find ${{ github.workspace }} -name $application.jar); \
+          if [ "$jarfile" == "" ]; then echo "$jarfile.jar not found from local repository"; exit 1; fi; \
+          gsutil cp $jarfile gs://$BUCKET/client/; \
+        done
+
+    # Create the server VM
+    - name: Create Server
+      run: |-
+        gcloud compute instances create-with-container $SERVER_INSTANCE \
+          --machine-type=$MACHINE_TYPE \
+          --scopes="userinfo-email,storage-rw" \
+          --zone=$ZONE \
+          --tags=benchmark-tag \
+          --network=default \
+          --container-image=gcr.io/$PROJECT_ID/$SERVER_INSTANCE-image:latest \
+          --container-restart-policy=never \
+          --container-env=PROJECT_ID=$PROJECT_ID,BUCKET=$BUCKET \
+          > /dev/null 2>&1
+
+    # Create client VM (it will move each jars from client bucket into server bucket)
+    - name: Create Client
+      run: |-
+        INTERNAL_IP=`gcloud compute instances list --filter="name=$SERVER_INSTANCE" --format='value(networkInterfaces[0].networkIP)'`
+        gcloud compute instances create-with-container $CLIENT_INSTANCE \
+          --machine-type=$MACHINE_TYPE \
+          --scopes="userinfo-email,storage-rw" \
+          --zone=$ZONE \
+          --tags=benchmark-tag \
+          --network=default \
+          --container-image=gcr.io/$PROJECT_ID/$CLIENT_INSTANCE-image:latest \
+          --container-restart-policy=never \
+          --container-env="BUCKET=$BUCKET,SERVER_HOST=${INTERNAL_IP}:8080,SIMULATIONS=$SIMULATIONS,INCREMENT=$INCREMENT,STEPS=$STEPS" \
+          > /dev/null 2>&1
+
+    # Wait for the results (each test generates a zip file, and we also wait for gh-benchmark.json
+    - name: Wait for test result
+      run: |-
+        expected=$(echo $APP | tr ";" "\n" | wc -l)
+        expected=`expr $expected + 1`
+        results=0
+        for i in {1..360}; do
+          found=$(gsutil ls gs://$BUCKET/results 2>/dev/null|wc -l);
+          if [ "$found" -gt 0 ]; then
+            results=`expr $results + $found`;
+            if [ $results -ge $expected ]; then
+              break;
+            fi
+            if [ "$i" == "360" ]; then
+              echo "Result timeout";
+              exit 1;
+            fi
+          fi
+          sleep 10;
+        done
+
+    # Download test result
+    - name: Download test results
+      run: |-
+        mkdir -p results
+        gsutil cp gs://$BUCKET/results/* results/
+
+    # Upload test result
+    - name: Archive test results
+      uses: actions/upload-artifact@v3
+      with:
+        # Artifact name
+        name: results
+        # A file, directory or wildcard pattern that describes what to upload
+        path: results/**
+        # The desired behavior if no files are found using the provided path.
+        if-no-files-found: error
+        # Duration after which artifact will expire in days. 0 means using default retention.
+        retention-days: 10
+
+    # Compute trending and send an alert in case of performance regression
+    - name: Store benchmark trends
+      if: env.TRENDS
+      uses: benchmark-action/github-action-benchmark@v1.15.0
+      with:
+        name: Web Benchmark Trends
+        tool: 'customBiggerIsBetter'
+        output-file-path: results/gh-benchmark.json
+        auto-push: false
+        alert-threshold: ${{ env.ALERT_THRESHOLD }}
+        fail-threshold: ${{ env.ALERT_THRESHOLD }}
+        comment-on-alert: false
+        fail-on-alert: true
+
+    - name: Push benchmark trends
+      if: always()
+      run: git push 'https://pderop:${{ secrets.PERSONAL_GITHUB_TOKEN }}@github.com/pderop/web-benchmarks.git' gh-pages:gh-pages
+
+    # Cleanup GCP instances and resources
+    - name: Remove GCP instances and resources
+      if: always()
+      run: |-
+        gcloud compute instances delete $CLIENT_INSTANCE --quiet --zone $ZONE | echo
+        gcloud compute instances delete $SERVER_INSTANCE --quiet --zone $ZONE | echo
+        gsutil rm -f gs://$BUCKET/client/* | echo
+        gsutil rm -f gs://$BUCKET/server/* | echo
+        gsutil rm -f gs://$BUCKET/results/* | echo

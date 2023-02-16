@@ -1,0 +1,76 @@
+name: containers-deploy
+
+on:
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT }}
+  CLIENT_INSTANCE: ${{ secrets.CLIENT_INSTANCE }}
+  SERVER_INSTANCE: ${{ secrets.SERVER_INSTANCE }}
+  GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+
+jobs:
+  setup-containers:
+    name: Setup, Build, Publish, and Deploy
+    runs-on: ubuntu-latest
+
+    # Add "id-token" with the intended permissions.
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Set up JDK
+      uses: actions/setup-java@v3
+      with:
+        java-version: '8'
+        distribution: 'temurin'
+
+    # Configure Workload Identity Federation and generate an access token.
+#    - id: 'auth'
+#      name: 'Authenticate to Google Cloud'
+#      uses: 'google-github-actions/auth@v1'
+#      with:
+#        workload_identity_provider: '${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}'
+#        service_account: '${{ secrets.GCP_SERVICE_ACCOUNT }}'
+
+    # Alternative option - authentication via credentials json
+    - id: 'auth'
+      uses: 'google-github-actions/auth@v1'
+      with:
+        credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
+
+    # Setup gcloud CLI
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+
+    # Configure Docker to use the gcloud command-line tool as a credential helper for authentication
+    - run: |-
+        gcloud --quiet auth configure-docker
+
+    # Purge old containers
+    - name: Purge old images
+      run: |-
+        gcloud container images list-tags gcr.io/$PROJECT_ID/$SERVER_INSTANCE-image \
+          --format="get(digest)" | \
+          awk -v image_path="gcr.io/$PROJECT_ID/$SERVER_INSTANCE-image@" '{print image_path $1}' | \
+          xargs -r gcloud container images delete --force-delete-tags --quiet
+        gcloud container images list-tags gcr.io/$PROJECT_ID/$CLIENT_INSTANCE-image \
+          --format="get(digest)" | \
+          awk -v image_path="gcr.io/$PROJECT_ID/$CLIENT_INSTANCE-image@" '{print image_path $1}' | \
+          xargs -r gcloud container images delete --force-delete-tags --quiet
+
+    # Build the Docker images
+    - name: Build containers
+      run: |-
+        docker build --tag "gcr.io/$PROJECT_ID/$SERVER_INSTANCE-image:latest" containers/server
+        docker build --tag "gcr.io/$PROJECT_ID/$CLIENT_INSTANCE-image:latest" containers/client
+
+    # Push the Docker image to Google Container Registry
+    - name: Push containers to GCR
+      run: |-
+        docker push "gcr.io/$PROJECT_ID/$SERVER_INSTANCE-image:latest"
+        docker push "gcr.io/$PROJECT_ID/$CLIENT_INSTANCE-image:latest"

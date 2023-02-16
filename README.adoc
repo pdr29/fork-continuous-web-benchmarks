@@ -1,0 +1,12 @@
+# Continuous Spring Web Benchmarks
+
+This (prototype) repository provides a GitHub Action for continuous projectreactor web benchmarking using Google Cloud Platform.
+It is inspired from `web-benchmark` project, but instead of using scripts, some github actions are used to continuously create/deploy/run/delete GCP VMs.
+
+# Google Cloud Platform setup:
+
+TODO
+
+# Sample Usage
+
+TODO

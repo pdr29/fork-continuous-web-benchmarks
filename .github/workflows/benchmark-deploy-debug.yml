@@ -1,0 +1,96 @@
+name: benchmark-deploy-debug
+
+on:
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT }}
+  SERVER_INSTANCE: ${{ vars.SERVER_INSTANCE }}
+  CLIENT_INSTANCE: ${{ vars.CLIENT_INSTANCE }}
+  BUCKET: ${{ vars.BUCKET }}
+  ZONE: ${{ vars.ZONE }}
+  MACHINE_TYPE: ${{ vars.MACHINE_TYPE }}
+  IMAGE_FAMILY: ${{ vars.IMAGE_FAMILY }}
+  IMAGE_PROJECT: ${{ vars.IMAGE_PROJECT }}
+
+jobs:
+  setup-debug:
+    name: Setup Debug VMs
+    runs-on: ubuntu-latest
+
+    # Add "id-token" with the intended permissions.
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Set up JDK
+      uses: actions/setup-java@v3
+      with:
+        java-version: '8'
+        distribution: 'temurin'
+
+    # Configure Workload Identity Federation and generate an access token.
+#    - id: 'auth'
+#      name: 'Authenticate to Google Cloud'
+#      uses: 'google-github-actions/auth@v1'
+#      with:
+#        workload_identity_provider: '${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}'
+#        service_account: '${{ secrets.GCP_SERVICE_ACCOUNT }}'
+
+    # Alternative option - authentication via credentials json
+    - id: 'auth'
+      uses: 'google-github-actions/auth@v1'
+      with:
+        credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+    # Setup gcloud CLI
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+
+    - name: Maven Compile
+      run: mvn --quiet -B package --file pom.xml
+
+    # Copy application to gcp server bucket
+    - name: Copy applications to server bucket
+      run: |-
+        for jarfile in $(find . -name "*-SNAPSHOT.jar"); do
+          gsutil cp $jarfile gs://$BUCKET/server/
+        done
+
+    # Create the server VM (it will move all jars from bucket/server into the VM)
+    - name: Create Server VM
+      run: |-
+        gcloud compute instances create $SERVER_INSTANCE \
+          --machine-type=$MACHINE_TYPE \
+          --scopes="userinfo-email,storage-rw" \
+          --zone=$ZONE \
+          --tags=benchmark-tag \
+          --network=default \
+          --image-family=$IMAGE_FAMILY \
+          --image-project=$IMAGE_PROJECT \
+          --metadata-from-file startup-script=vm/server/startup.sh \
+          --metadata BUCKET=$BUCKET,PROJECT_ID=$PROJECT_ID \
+          > /dev/null 2>&1
+
+    # Create client VM
+    - name: Create Client VM
+      run: |-
+        ./scripts/install-gatling.sh .
+        tar zcvf gatling.tgz gatling
+        gsutil cp gatling.tgz gs://$BUCKET/client/
+        INTERNAL_IP=`gcloud compute instances list --filter="name=$SERVER_INSTANCE" --format='value(networkInterfaces[0].networkIP)'`
+        gcloud compute instances create $CLIENT_INSTANCE \
+          --machine-type=$MACHINE_TYPE \
+          --scopes="userinfo-email,storage-rw" \
+          --zone=$ZONE \
+          --tags=benchmark-tag \
+          --network=default \
+          --image-family=$IMAGE_FAMILY \
+          --image-project=$IMAGE_PROJECT \
+          --metadata-from-file startup-script=vm/client/startup.sh \
+          --metadata BUCKET=$BUCKET,PROJECT_ID=$PROJECT_ID,INTERNAL_IP=$INTERNAL_IP \
+          > /dev/null 2>&
